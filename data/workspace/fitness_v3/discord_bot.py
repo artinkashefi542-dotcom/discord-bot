@@ -1,0 +1,1490 @@
+#!/usr/bin/env python3
+"""
+AK Discord RP Punishment + Robbery Bot
+"""
+import discord
+import urllib.request
+import urllib.parse
+from discord import app_commands
+import sqlite3
+import os
+import re
+import json
+import asyncio
+import subprocess
+from datetime import datetime, timedelta
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
+MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", "0"))
+ROSTER_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzVwaglnIV_6_65JHdshWrwKkST7gAVPTTyCF9l_aTSY_6XIZKiRzqAMr8xZFQMkW9z/exec"
+ROSTER_API_KEY = "roster_mec_2026_secured"
+
+ROLE_NAMES = {
+    "warn": "Warn",
+    "strike1": "Strike Ⅰ",
+    "strike2": "Strike ⅠⅠ",
+    "strike3": "Strike ⅠⅠⅠ",
+    "fired": "fired",
+}
+
+ROBBERY_LOCATIONS = [
+    app_commands.Choice(name="🏦 Maze Bank", value="Maze Bank"),
+    app_commands.Choice(name="🏛️ Central Bank", value="Central Bank"),
+    app_commands.Choice(name="📦 Cargo", value="Cargo"),
+    app_commands.Choice(name="🏜️ Blaine County", value="Blaine County"),
+    app_commands.Choice(name="🏧 Fleeca", value="Fleeca"),
+    app_commands.Choice(name="🏢 Life Invader", value="Life Invader"),
+    app_commands.Choice(name="💎 Jewelry", value="Jewelry"),
+    app_commands.Choice(name="🚛 Armored Truck", value="Armored Truck"),
+    app_commands.Choice(name="🏪 Shop", value="Shop"),
+    app_commands.Choice(name="🔒 Code 1", value="Code 1"),
+    app_commands.Choice(name="❓ Other", value="Other"),
+]
+
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
+
+DB_PATH = "/data/workspace/fitness_v3/punishments.db"
+
+GANG_FINE_ALLOWED_ROLES = [1327719709629747343, 1545186892755243068]
+GANG_FINE_PAYMENT_ROLE = 1327719709629747343
+
+
+# ── Database ──────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS punishments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            guild_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            reason TEXT DEFAULT 'No reason',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS robberies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            location TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manager_id TEXT NOT NULL,
+            best_player_id TEXT,
+            best_assist_id TEXT,
+            photo_url TEXT,
+            created_by TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS robbery_players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            robbery_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            kills INTEGER DEFAULT 0,
+            FOREIGN KEY (robbery_id) REFERENCES robberies(id)
+        )
+    """)
+    # Points system tables
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS points (
+            user_id TEXT PRIMARY KEY,
+            username TEXT,
+            nickname TEXT,
+            badge TEXT,
+            points INTEGER DEFAULT 0,
+            gang_points INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS gang_fines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            plate TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            paid INTEGER DEFAULT 0,
+            moderator_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS point_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            type TEXT,
+            action TEXT,
+            value INTEGER,
+            moderator_id TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# ── Punishment DB ─────────────────────────────────────────────
+def add_punishment(user_id, guild_id, ptype, reason):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO punishments (user_id, guild_id, type, reason) VALUES (?, ?, ?, ?)",
+              (user_id, guild_id, ptype, reason))
+    conn.commit()
+    conn.close()
+
+def get_warn_count(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    c.execute("SELECT COUNT(*) FROM punishments WHERE user_id=? AND guild_id=? AND type='warn' AND created_at > ?",
+              (user_id, guild_id, week_ago))
+    count = c.fetchone()[0]
+    conn.close()
+    return min(count, 1)
+
+def get_strike_count(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM punishments WHERE user_id=? AND guild_id=? AND type='strike'",
+              (user_id, guild_id))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+def get_total_warns(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM punishments WHERE user_id=? AND guild_id=? AND type='warn'",
+              (user_id, guild_id))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+def get_total_strikes(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM punishments WHERE user_id=? AND guild_id=? AND type='strike'",
+              (user_id, guild_id))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+def get_all_punishments(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT type, reason, created_at FROM punishments WHERE user_id=? AND guild_id=? ORDER BY created_at DESC LIMIT 20",
+              (user_id, guild_id))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def clear_warns(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM punishments WHERE user_id=? AND guild_id=? AND type='warn'", (user_id, guild_id))
+    conn.commit()
+    conn.close()
+
+def clear_strikes(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM punishments WHERE user_id=? AND guild_id=? AND type='strike'", (user_id, guild_id))
+    conn.commit()
+    conn.close()
+
+def clear_all(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM punishments WHERE user_id=? AND guild_id=?", (user_id, guild_id))
+    conn.commit()
+    conn.close()
+
+# ── Robbery DB ────────────────────────────────────────────────
+def add_robbery(guild_id, location, status, manager_id, best_player_id, best_assist_id, photo_url, created_by):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""INSERT INTO robberies (guild_id, location, status, manager_id, best_player_id, best_assist_id, photo_url, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              (guild_id, location, status, manager_id, best_player_id, best_assist_id, photo_url, created_by))
+    robbery_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return robbery_id
+
+def add_robbery_player(robbery_id, user_id, kills):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO robbery_players (robbery_id, user_id, kills) VALUES (?, ?, ?)",
+              (robbery_id, user_id, kills))
+    conn.commit()
+    conn.close()
+
+def get_user_robbery_stats(user_id, guild_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Total robberies participated
+    c.execute("""SELECT COUNT(DISTINCT r.id) FROM robberies r 
+                 JOIN robbery_players rp ON rp.robbery_id = r.id 
+                 WHERE rp.user_id=? AND r.guild_id=?""", (user_id, guild_id))
+    total_robberies = c.fetchone()[0]
+    
+    # Total kills
+    c.execute("""SELECT COALESCE(SUM(rp.kills), 0) FROM robberies r 
+                 JOIN robbery_players rp ON rp.robbery_id = r.id 
+                 WHERE rp.user_id=? AND r.guild_id=?""", (user_id, guild_id))
+    total_kills = c.fetchone()[0]
+    
+    # Wins/Losses
+    c.execute("""SELECT r.status, COUNT(*) FROM robberies r 
+                 JOIN robbery_players rp ON rp.robbery_id = r.id 
+                 WHERE rp.user_id=? AND r.guild_id=? GROUP BY r.status""", (user_id, guild_id))
+    wl = dict(c.fetchall())
+    
+    # Breakdown by location
+    c.execute("""SELECT r.location, COUNT(*) FROM robberies r 
+                 JOIN robbery_players rp ON rp.robbery_id = r.id 
+                 WHERE rp.user_id=? AND r.guild_id=? GROUP BY r.location ORDER BY COUNT(*) DESC""", (user_id, guild_id))
+    locations = c.fetchall()
+    
+    # As manager
+    c.execute("""SELECT COUNT(*) FROM robberies WHERE manager_id=? AND guild_id=?""", (user_id, guild_id))
+    as_manager = c.fetchone()[0]
+    
+    # Best player count
+    c.execute("""SELECT COUNT(*) FROM robberies WHERE best_player_id=? AND guild_id=?""", (user_id, guild_id))
+    best_player_count = c.fetchone()[0]
+    
+    conn.close()
+    return {
+        "total_robberies": total_robberies,
+        "total_kills": total_kills,
+        "wins": wl.get("Win", 0),
+        "losses": wl.get("Loss", 0),
+        "locations": locations,
+        "as_manager": as_manager,
+        "best_player_count": best_player_count,
+    }
+
+# ── Role Management ───────────────────────────────────────────
+async def apply_roles(member, warn_count, strike_count):
+    guild = member.guild
+    for name in ROLE_NAMES.values():
+        role = discord.utils.get(guild.roles, name=name)
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Updating punishment")
+            except:
+                pass
+    
+    if strike_count >= 3:
+        role = discord.utils.get(guild.roles, name=ROLE_NAMES["fired"])
+        if role:
+            try:
+                await member.add_roles(role, reason="Fired")
+            except:
+                pass
+        return
+    
+    if strike_count == 1:
+        role = discord.utils.get(guild.roles, name=ROLE_NAMES["strike1"])
+    elif strike_count == 2:
+        role = discord.utils.get(guild.roles, name=ROLE_NAMES["strike2"])
+    else:
+        role = None
+    
+    if role:
+        try:
+            await member.add_roles(role, reason=f"Strike {strike_count}")
+        except:
+            pass
+    
+    if warn_count > 0 and strike_count < 3:
+        role = discord.utils.get(guild.roles, name=ROLE_NAMES["warn"])
+        if role:
+            try:
+                await member.add_roles(role, reason=f"Warn {warn_count}")
+            except:
+                pass
+
+# ── Helpers ───────────────────────────────────────────────────
+def is_mod(member):
+    if MOD_ROLE_ID == 0:
+        return member.guild_permissions.moderate_members
+    role = member.guild.get_role(MOD_ROLE_ID)
+    return role in member.roles if role else False
+
+def status_text(warns, strikes):
+    if strikes >= 3:
+        return "🔴 **FIRED**"
+    return f"⚠️ Warns: **{warns}/1** | ⚡ Strikes: **{strikes}/3**"
+
+def parse_players(text, guild):
+    """Parse ' @user / 2, @user / 3' into [(member, kills), ...]"""
+    players = []
+    # Match patterns like <@123> / 2 or <@!123>/2 or 123/2
+    pattern = r'<@!?(\d+)>\s*/\s*(\d+)'
+    matches = re.findall(pattern, text)
+    for user_id, kills in matches:
+        member = guild.get_member(int(user_id))
+        if member:
+            players.append((member, int(kills)))
+    return players
+
+# ── Bot Events ────────────────────────────────────────────────
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            tree.copy_global_to(guild=guild)
+            synced = await tree.sync(guild=guild)
+            print(f"✅ Synced {len(synced)} commands to guild {GUILD_ID}")
+        else:
+            await tree.sync()
+            print("✅ Synced globally")
+    except Exception as e:
+        print(f"❌ Sync error: {e}")
+    bot.loop.create_task(roster_periodic_sync())
+    await roster_sync_cache()
+
+# ── Punishment Commands ───────────────────────────────────────
+@tree.command(name="punishment", description="Issue a warning or strike to a user")
+@app_commands.describe(action="warn or strike", user="Target user", reason="Reason")
+@app_commands.choices(action=[
+    app_commands.Choice(name="warn", value="warn"),
+    app_commands.Choice(name="strike", value="strike"),
+])
+async def punishment(interaction: discord.Interaction, action: app_commands.Choice[str], user: discord.Member, reason: str = "No reason"):
+    if not is_mod(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission", ephemeral=True)
+        return
+    
+    uid = str(user.id)
+    gid = str(interaction.guild_id)
+    
+    if action.value == "warn":
+        current_warns = get_warn_count(uid, gid)
+        current_strikes = get_strike_count(uid, gid)
+        add_punishment(uid, gid, "warn", reason)
+        new_warns = 1
+        new_strikes = current_strikes
+        
+        if current_warns >= 1:
+            add_punishment(uid, gid, "strike", "Converted from warn (2nd+ warn = strike)")
+            new_strikes = current_strikes + 1
+        
+        is_fired = new_strikes >= 3
+        
+        if current_warns == 0:
+            embed = discord.Embed(title="⚠️ Warning Issued", color=0xffeb3b)
+            embed.set_footer(text="First warning. Next warn = Strike 1/3")
+        else:
+            embed = discord.Embed(title="⚠️ Warning → Strike Converted", color=0xf44336)
+            embed.set_footer(text="2nd+ warning converts to strike")
+        
+        embed.add_field(name="User", value=user.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=True)
+        embed.add_field(name="Status", value=status_text(new_warns, new_strikes), inline=False)
+        
+        if is_fired:
+            embed.add_field(name="🚫 FIRED!", value=f"{user.mention} has been fired!", inline=False)
+            embed.color = 0x9c27b0
+        
+        await interaction.response.send_message(embed=embed)
+        await apply_roles(user, new_warns, new_strikes)
+    
+    elif action.value == "strike":
+        current_warns = get_warn_count(uid, gid)
+        current_strikes = get_strike_count(uid, gid)
+        add_punishment(uid, gid, "strike", reason)
+        new_strikes = current_strikes + 1
+        new_warns = 1
+        is_fired = new_strikes >= 3
+        
+        embed = discord.Embed(title="⚡ Strike Issued", color=0xf44336)
+        embed.add_field(name="User", value=user.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=True)
+        embed.add_field(name="Status", value=status_text(new_warns, new_strikes), inline=False)
+        embed.set_footer(text="Strikes do not expire. 3 strikes = Fired")
+        
+        if is_fired:
+            embed.add_field(name="🚫 FIRED!", value=f"{user.mention} has been fired!", inline=False)
+            embed.color = 0x9c27b0
+        
+        await interaction.response.send_message(embed=embed)
+        await apply_roles(user, new_warns, new_strikes)
+
+@tree.command(name="punishment_list", description="View user punishment history")
+@app_commands.describe(user="Target user")
+async def punishment_list(interaction: discord.Interaction, user: discord.Member):
+    uid = str(user.id)
+    gid = str(interaction.guild_id)
+    warns = get_warn_count(uid, gid)
+    strikes = get_strike_count(uid, gid)
+    all_p = get_all_punishments(uid, gid)
+    total_warns = get_total_warns(uid, gid)
+    total_strikes = get_total_strikes(uid, gid)
+    
+    embed = discord.Embed(title=f"📋 {user.display_name}'s Record", color=0x2196f3)
+    embed.add_field(name="Current Status", value=status_text(warns, strikes), inline=False)
+    embed.add_field(name="Total Warnings", value=str(total_warns), inline=True)
+    embed.add_field(name="Total Strikes", value=str(total_strikes), inline=True)
+    
+    if all_p:
+        lines = []
+        for p in all_p:
+            icon = "⚠️" if p[0] == "warn" else "⚡"
+            date = p[2][:10] if p[2] else "?"
+            lines.append(f"{icon} {p[0].upper()}: {p[1]} ({date})")
+        embed.add_field(name="History", value="\n".join(lines[:10]) or "Empty", inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="punishment_clear", description="Clear user punishments (Mod only)")
+@app_commands.describe(user="Target user", type="What to clear")
+@app_commands.choices(type=[
+    app_commands.Choice(name="warns", value="warn"),
+    app_commands.Choice(name="strikes", value="strike"),
+    app_commands.Choice(name="all", value="all"),
+])
+async def punishment_clear(interaction: discord.Interaction, user: discord.Member, type: app_commands.Choice[str]):
+    if not is_mod(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission", ephemeral=True)
+        return
+    
+    uid = str(user.id)
+    gid = str(interaction.guild_id)
+    
+    if type.value == "warn":
+        clear_warns(uid, gid)
+    elif type.value == "strike":
+        clear_strikes(uid, gid)
+    else:
+        clear_all(uid, gid)
+    
+    for name in ROLE_NAMES.values():
+        role = discord.utils.get(user.guild.roles, name=name)
+        if role and role in user.roles:
+            try:
+                await user.remove_roles(role, reason="Punishments cleared")
+            except:
+                pass
+    
+    warns = get_warn_count(uid, gid)
+    strikes = get_strike_count(uid, gid)
+    
+    await interaction.response.send_message(
+        f"✅ **{type.value.title()}** cleared for {user.mention}\n{status_text(warns, strikes)}",
+        ephemeral=True
+    )
+
+# ── Robbery Commands ──────────────────────────────────────────
+@tree.command(name="robbery", description="Log a robbery result")
+@app_commands.describe(
+    location="Robbery location",
+    status="Win or Loss",
+    manager="Rob Manager",
+    best_player="Best Player",
+    best_assist="Best Assist (optional)",
+    players="Players with kills: @user / kills, @user / kills",
+    photo="Screenshot (optional)"
+)
+@app_commands.choices(
+    location=ROBBERY_LOCATIONS,
+    status=[
+        app_commands.Choice(name="✅ Win", value="Win"),
+        app_commands.Choice(name="❌ Loss", value="Loss"),
+    ]
+)
+async def robbery(interaction: discord.Interaction, location: app_commands.Choice[str], status: app_commands.Choice[str], manager: discord.Member, best_player: discord.Member, players: str, best_assist: discord.Member = None, photo: discord.Attachment = None):
+    gid = str(interaction.guild_id)
+    
+    # Parse players
+    player_list = parse_players(players, interaction.guild)
+    if not player_list:
+        await interaction.response.send_message("❌ No valid players found. Use format: `<@user> / kills`", ephemeral=True)
+        return
+    
+    # Save to database
+    photo_url = photo.url if photo else None
+    robbery_id = add_robbery(gid, location.value, status.value, str(manager.id), str(best_player.id), str(best_assist.id) if best_assist else None, photo_url, str(interaction.user.id))
+    
+    for member, kills in player_list:
+        add_robbery_player(robbery_id, str(member.id), kills)
+    
+    # Build embed
+    status_icon = "✅" if status.value == "Win" else "❌"
+    color = 0x00e676 if status.value == "Win" else 0xf44336
+    
+    embed = discord.Embed(color=color)
+    embed.set_author(name=f"💰 Robbery: {location.value}", icon_url="https://i.imgur.com/money.png")
+    
+    # Status
+    embed.add_field(name="Status", value=f"{status_icon} **{status.value}**", inline=True)
+    embed.add_field(name="Rob Manager", value=manager.mention, inline=True)
+    embed.add_field(name="Best Player", value=best_player.mention, inline=True)
+    
+    if best_assist:
+        embed.add_field(name="Best Assist", value=best_assist.mention, inline=True)
+    else:
+        embed.add_field(name="Best Assist", value="❌", inline=True)
+    
+    # Players with kills - compact format
+    player_parts = []
+    for member, kills in player_list:
+        player_parts.append(f"{member.mention} ({kills}kill)")
+    embed.add_field(name="Player", value=" ".join(player_parts), inline=False)
+    
+    # Photo
+    if photo:
+        embed.set_image(url=photo.url)
+    
+    # Timestamp
+    embed.timestamp = datetime.utcnow()
+    embed.set_footer(text=f"Logged by {interaction.user.display_name}")
+    
+    await interaction.response.send_message(embed=embed)
+
+
+
+
+# ── Roster Cache (fast local reads) ──────────────────────────
+import threading
+
+ROSTER_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'roster_cache.json')
+_roster_cache = None
+_roster_cache_loaded = False
+
+async def roster_sync_cache():
+    """Sync roster from Google Sheets to local JSON cache (non-blocking)"""
+    global _roster_cache
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'curl', '-sL', '--connect-timeout', '10', '--max-time', '20',
+            f'{ROSTER_SCRIPT_URL}?action=read',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+        if proc.returncode == 0 and stdout.strip():
+            data = json.loads(stdout.decode().strip())
+            _roster_cache = data
+            with open(ROSTER_CACHE_FILE, 'w') as f:
+                json.dump(data, f)
+            print(f"[Roster] Cache synced: {len(data)} rows")
+            return True
+    except Exception as e:
+        print(f"[Roster] Sync error: {e}")
+    return False
+
+def roster_load_cache():
+    """Load roster from local cache file"""
+    global _roster_cache
+    if _roster_cache:
+        return _roster_cache
+    try:
+        if os.path.exists(ROSTER_CACHE_FILE):
+            with open(ROSTER_CACHE_FILE) as f:
+                _roster_cache = json.load(f)
+            return _roster_cache
+    except:
+        pass
+    return None
+
+def roster_find_empty_slot_fast(rank_name):
+    """Find empty slot from cache (instant!)"""
+    data = roster_load_cache()
+    if not data:
+        # Fallback to remote if no cache
+        return roster_find_empty_slot(rank_name)
+    for i, row in enumerate(data):
+        if len(row) > 4 and row[3] == rank_name and row[1] == '':
+            return {'row': i + 1, 'badge': row[4]}
+    return {'error': 'No empty slot'}
+
+def roster_write_slot_fast(row, name, discord_name, badge, call_sign=""):
+    """Write to sheet AND update local cache (instant!)"""
+    global _roster_cache
+    # Update local cache immediately
+    if _roster_cache and row <= len(_roster_cache):
+        _roster_cache[row-1][1] = name
+        _roster_cache[row-1][2] = discord_name
+        if call_sign and len(_roster_cache[row-1]) > 5:
+            _roster_cache[row-1][5] = call_sign
+    # Save to file
+    try:
+        with open(ROSTER_CACHE_FILE, 'w') as f:
+            json.dump(_roster_cache, f)
+    except:
+        pass
+    # Sync to Google Sheets in background
+    def _bg_write():
+        roster_write_slot_full(row, name, discord_name, badge, call_sign)
+    threading.Thread(target=_bg_write, daemon=True).start()
+    return True
+
+def roster_clear_slot_fast(row, badge):
+    """Clear from sheet AND update local cache - resets to empty slot (MEC)"""
+    global _roster_cache
+    if _roster_cache and row <= len(_roster_cache):
+        _roster_cache[row-1][1] = ''
+        _roster_cache[row-1][2] = ''
+        if len(_roster_cache[row-1]) > 5:
+            _roster_cache[row-1][5] = 'MEC'
+    try:
+        with open(ROSTER_CACHE_FILE, 'w') as f:
+            json.dump(_roster_cache, f)
+    except:
+        pass
+    def _bg_clear():
+        roster_clear_slot_remote(row, badge)
+    threading.Thread(target=_bg_clear, daemon=True).start()
+    return True
+
+def roster_find_user_fast(discord_name):
+    """Find user in cache by Discord username (instant!)"""
+    data = roster_load_cache()
+    if not data:
+        return None
+    for i, row in enumerate(data):
+        if len(row) > 2 and str(row[2]).strip().lower() == str(discord_name).strip().lower():
+            return {'row': i + 1, 'name': row[1], 'rank': row[3], 'badge': row[4]}
+    return None
+
+def roster_find_all_users_fast(discord_name):
+    """Find ALL matching rows by Discord username"""
+    data = roster_load_cache()
+    results = []
+    if not data:
+        return results
+    for i, row in enumerate(data):
+        if len(row) > 2 and str(row[2]).strip().lower() == str(discord_name).strip().lower():
+            results.append({'row': i + 1, 'name': row[1], 'rank': row[3], 'badge': row[4]})
+    return results
+
+async def roster_periodic_sync():
+    """Background task to sync roster every 5 minutes"""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await roster_sync_cache()
+        await asyncio.sleep(300)  # 5 minutes
+
+
+# ── Google Sheets Integration ─────────────────────────────────
+RANK_TO_SHEET = {
+    "1 │ Trainee": "Trainee",
+    "2 │ Patrol": "Patrol",
+    "3 │ Welder": "Welder",
+    "4 │ Car Relief": "Car Relief",
+    "5  │ Diesel Expert": "Diesel Expert",
+    "6 │ Technician": "Technician",
+    "7│ Specialist": "Specialist",
+    "8 │ Professional": "Professional",
+    "9 │ Staff": "Staff",
+    "10 | Team Manage": "Team Manager",
+    "11 | Manager": "Manager",
+    "12 | Director": "Director",
+}
+
+SHEET_RANK_TO_ROLE = {v: k for k, v in RANK_TO_SHEET.items()}
+
+def _roster_curl(params_str):
+    """Use curl to call Google Apps Script (handles redirects properly)"""
+
+    try:
+        url = f"{ROSTER_SCRIPT_URL}?{params_str}"
+        result = subprocess.run(
+            ['curl', '-sL', '--connect-timeout', '30', '--max-time', '60', url],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+        return None
+    except Exception as e:
+        print(f"Roster curl error: {e}")
+        return None
+
+def roster_find_empty_slot(rank_name):
+    try:
+        params = urllib.parse.urlencode({'action': 'findEmptySlot', 'rank': rank_name})
+        return _roster_curl(params)
+    except Exception as e:
+        print(f"Roster findEmptySlot error: {e}")
+        return None
+
+def roster_write_slot_full(row, name, discord_name, badge, call_sign=""):
+    try:
+        params = urllib.parse.urlencode({'action': 'write', 'row': row, 'name': name, 'discord': discord_name, 'badge': badge, 'callsign': call_sign})
+        data = _roster_curl(params)
+        return data and data.get('status') == 'done'
+    except Exception as e:
+        print(f"Roster write error: {e}")
+        return False
+
+def roster_clear_slot_remote(row, badge):
+    try:
+        params = urllib.parse.urlencode({'action': 'write', 'row': row, 'name': '', 'discord': '', 'badge': badge, 'callsign': 'MEC'})
+        _roster_curl(params)
+        return True
+    except:
+        return False
+
+def roster_find_user(discord_name):
+    try:
+        data = _roster_curl('action=read')
+        if not data:
+            return None
+        for i, row in enumerate(data):
+            if len(row) > 2 and row[2] == discord_name:
+                return {'row': i + 1, 'name': row[1], 'rank': row[3], 'badge': row[4]}
+        return None
+    except Exception as e:
+        print(f"Roster findUser error: {e}")
+        return None
+
+# ── Rankup Command ────────────────────────────────────────────
+RANK_CHOICES = [
+    app_commands.Choice(name="1 │ Trainee", value="1 │ Trainee"),
+    app_commands.Choice(name="2 │ Patrol", value="2 │ Patrol"),
+    app_commands.Choice(name="3 │ Welder", value="3 │ Welder"),
+    app_commands.Choice(name="4 │ Car Relief", value="4 │ Car Relief"),
+    app_commands.Choice(name="5 │ Diesel Expert", value="5  │ Diesel Expert"),
+    app_commands.Choice(name="6 │ Technician", value="6 │ Technician"),
+    app_commands.Choice(name="7│ Specialist", value="7│ Specialist"),
+    app_commands.Choice(name="8 │ Professional", value="8 │ Professional"),
+    app_commands.Choice(name="9 │ Staff", value="9 │ Staff"),
+    app_commands.Choice(name="10 | Team Manage", value="10 | Team Manage"),
+    app_commands.Choice(name="11 | Manager", value="11 | Manager"),
+    app_commands.Choice(name="12 | Director", value="12 | Director"),
+]
+
+@tree.command(name="rankup", description="Promote a user to a new rank (Managements only)")
+@app_commands.describe(
+    user="User to promote",
+    current_rank="Current rank role",
+    new_rank="New rank role"
+)
+@app_commands.choices(
+    current_rank=RANK_CHOICES,
+    new_rank=RANK_CHOICES
+)
+async def rankup(interaction: discord.Interaction, user: discord.Member, current_rank: app_commands.Choice[str], new_rank: app_commands.Choice[str]):
+    print(f"[RANKUP] Called by {interaction.user} for {user} -> {new_rank.value}")
+    try:
+        mod_role = interaction.guild.get_role(MOD_ROLE_ID)
+        if not mod_role or mod_role not in interaction.user.roles:
+            await interaction.response.send_message("❌ You don't have permission. Managements role required.", ephemeral=True)
+            return
+        old_role = discord.utils.get(interaction.guild.roles, name=current_rank.value)
+        new_role = discord.utils.get(interaction.guild.roles, name=new_rank.value)
+        if not old_role:
+            await interaction.response.send_message(f"❌ Role not found: {current_rank.value}", ephemeral=True)
+            return
+        if not new_role:
+            await interaction.response.send_message(f"❌ Role not found: {new_rank.value}", ephemeral=True)
+            return
+        sheet_rank = RANK_TO_SHEET.get(new_rank.value)
+        if not sheet_rank:
+            await interaction.response.send_message("❌ Unknown rank mapping", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+        slot = roster_find_empty_slot_fast(sheet_rank)
+        if not slot or 'error' in slot:
+            await interaction.followup.send(f"❌ No empty slot for **{sheet_rank}**!", ephemeral=True)
+            return
+        badge = slot['badge']
+        row = slot['row']
+        if old_role in user.roles:
+            await user.remove_roles(old_role, reason=f"Rankup to {new_rank.value}")
+        await user.add_roles(new_role, reason=f"Rankup by {interaction.user.display_name}")
+        old_nickname = re.sub(r'^\([^)]+\)', '', user.display_name).strip()
+        new_nickname = f"({badge}){old_nickname}"
+        try:
+            await user.edit(nick=new_nickname, reason="Rankup - Badge Number")
+        except:
+            pass
+        clean_name = re.sub(r'^\([^)]+\)', '', user.display_name).strip()
+        old_user = roster_find_user_fast(user.name)
+        old_mec = ""
+        if old_user:
+            data = roster_load_cache()
+            if data and old_user['row'] <= len(data):
+                old_mec = data[old_user['row']-1][5] if len(data[old_user['row']-1]) > 5 else ""
+                if old_mec is None:
+                    old_mec = ""
+            roster_clear_slot_fast(old_user['row'], old_user['badge'])
+        write_ok = roster_write_slot_fast(row, clean_name, user.name, badge, str(old_mec))
+        today = datetime.now().strftime("%Y-%m-%d")
+        embed = discord.Embed(color=0x00d4ff)
+        embed.set_author(name=f"🎉 Additional Staff Update {today}")
+        embed.add_field(name="", value=f"**{user.mention}** Has Been Promoted To {new_role.mention} And Will Be Known As **{new_nickname}**, Congrats! 🎊", inline=False)
+        embed.add_field(name="Previous Rank", value=old_role.mention, inline=True)
+        embed.add_field(name="New Rank", value=new_role.mention, inline=True)
+        embed.add_field(name="Badge Number", value=f"`{badge}`", inline=True)
+        if write_ok:
+            embed.add_field(name="📋 Roster", value="✅ Updated automatically", inline=False)
+        else:
+            embed.add_field(name="📋 Roster", value="⚠️ Sheet update failed", inline=False)
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.timestamp = datetime.utcnow()
+        embed.set_footer(text=f"Author: {interaction.user.mention}", icon_url=interaction.user.display_avatar.url)
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        print(f"[rankup ERROR] {e}")
+        import traceback; traceback.print_exc()
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+        except:
+            pass
+
+@tree.command(name="robbery_stats", description="View user robbery statistics (Mod only)")
+@app_commands.describe(user="Target user")
+async def robbery_stats(interaction: discord.Interaction, user: discord.Member):
+    if not is_mod(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission", ephemeral=True)
+        return
+    
+    uid = str(user.id)
+    gid = str(interaction.guild_id)
+    stats = get_user_robbery_stats(uid, gid)
+    
+    embed = discord.Embed(title=f"📊 {user.display_name}'s Robbery Stats", color=0x2196f3)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    
+    embed.add_field(name="🎯 Total Robberies", value=str(stats["total_robberies"]), inline=True)
+    embed.add_field(name="💀 Total Kills", value=str(stats["total_kills"]), inline=True)
+    embed.add_field(name="🏆 Best Player", value=str(stats["best_player_count"]), inline=True)
+    embed.add_field(name="📋 As Manager", value=str(stats["as_manager"]), inline=True)
+    embed.add_field(name="✅ Wins", value=str(stats["wins"]), inline=True)
+    embed.add_field(name="❌ Losses", value=str(stats["losses"]), inline=True)
+    
+    if stats["locations"]:
+        location_lines = []
+        for loc, count in stats["locations"]:
+            location_lines.append(f"• **{loc}**: {count}")
+        embed.add_field(name="📍 Locations", value="\n".join(location_lines), inline=False)
+    
+    win_rate = 0
+    if stats["total_robberies"] > 0:
+        win_rate = round((stats["wins"] / stats["total_robberies"]) * 100)
+    embed.add_field(name="📈 Win Rate", value=f"{win_rate}%", inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── Set Player Command ────────────────────────────────────────
+SET_RANK_CHOICES = [
+    app_commands.Choice(name="1 | Trainee", value="Trainee"),
+    app_commands.Choice(name="2 | Patrol", value="Patrol"),
+    app_commands.Choice(name="3 | Welder", value="Welder"),
+    app_commands.Choice(name="4 | Car Relief", value="Car Relief"),
+    app_commands.Choice(name="5 | Diesel Expert", value="Diesel Expert"),
+    app_commands.Choice(name="6 | Technician", value="Technician"),
+    app_commands.Choice(name="7 | Specialist", value="Specialist"),
+    app_commands.Choice(name="8 | Professional", value="Professional"),
+    app_commands.Choice(name="9 | Staff", value="Staff"),
+    app_commands.Choice(name="10 | Team Manage", value="Team Manager"),
+    app_commands.Choice(name="11 | Manager", value="Manager"),
+    app_commands.Choice(name="12 | Director", value="Director"),
+]
+
+RANK_SHEET_TO_ROLE = {
+    "Trainee": "1 │ Trainee",
+    "Patrol": "2 │ Patrol",
+    "Welder": "3 │ Welder",
+    "Car Relief": "4 │ Car Relief",
+    "Diesel Expert": "5  │ Diesel Expert",
+    "Technician": "6 │ Technician",
+    "Specialist": "7│ Specialist",
+    "Professional": "8 │ Professional",
+    "Staff": "9 │ Staff",
+    "Team Manager": "10 | Team Manage",
+    "Manager": "11 | Manager",
+    "Director": "12 | Director",
+}
+
+@tree.command(name="set_player", description="Set a player in roster with rank and badge (Managements only)")
+@app_commands.describe(
+    user="Discord user to set",
+    ic_name="Player IC name (e.g. Artin Kashefi)",
+    rank="Rank to assign",
+    call_sign="Badge number (e.g. PT-01, WL-02)"
+)
+@app_commands.choices(rank=SET_RANK_CHOICES)
+async def set_player(interaction: discord.Interaction, user: discord.Member, ic_name: str, rank: app_commands.Choice[str], call_sign: str):
+    try:
+        mod_role = interaction.guild.get_role(MOD_ROLE_ID)
+        if not mod_role or mod_role not in interaction.user.roles:
+            await interaction.response.send_message("❌ You don't have permission. Managements role required.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+        sheet_rank = rank.value
+        role_name = RANK_SHEET_TO_ROLE.get(sheet_rank)
+        if not role_name:
+            await interaction.followup.send(f"❌ Unknown rank: {sheet_rank}", ephemeral=True)
+            return
+        slot = roster_find_empty_slot_fast(sheet_rank)
+        if not slot or 'error' in slot:
+            await interaction.followup.send(f"❌ No empty slot for **{sheet_rank}**!", ephemeral=True)
+            return
+        badge_row = slot['row']
+        badge_number = slot['badge']
+        mec_number = f"MEC {call_sign.strip()}"
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
+        if not role:
+            await interaction.followup.send(f"\u274c Discord role not found: {role_name}", ephemeral=True)
+            return
+        await user.add_roles(role, reason=f"Set player by {interaction.user.display_name}")
+        mech_role = discord.utils.get(interaction.guild.roles, name="Mechanic Department")
+        if mech_role:
+            try:
+                await user.add_roles(mech_role, reason="Set player - auto add Mechanic Department")
+            except:
+                pass
+        if sheet_rank == "Trainee":
+            phase1_role = discord.utils.get(interaction.guild.roles, name="Phase 1")
+            if phase1_role:
+                try:
+                    await user.add_roles(phase1_role, reason="Set player - auto add Phase 1 for Trainee")
+                except:
+                    pass
+        new_nickname = f"({badge_number}){ic_name}"
+        try:
+            await user.edit(nick=new_nickname, reason="Set player - Badge Number")
+        except:
+            pass
+        write_ok = roster_write_slot_fast(badge_row, ic_name, user.name, badge_number, mec_number)
+        today = datetime.now().strftime("%Y-%m-%d")
+        embed = discord.Embed(color=0x00d4ff)
+        embed.set_author(name=f"🎉 Player Registration {today}")
+        embed.add_field(name="", value=f"**{user.mention}** has been registered as **{ic_name}**", inline=False)
+        embed.add_field(name="Rank", value=role.mention, inline=True)
+        embed.add_field(name="Badge Number", value=f"`{badge_number}`", inline=True)
+        embed.add_field(name="Call Sign", value=f"`{mec_number}`", inline=True)
+        embed.add_field(name="IC Name", value=f"`{ic_name}`", inline=True)
+        if write_ok:
+            embed.add_field(name="📋 Roster", value="✅ Updated automatically", inline=False)
+        else:
+            embed.add_field(name="📋 Roster", value="⚠️ Sheet update failed", inline=False)
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.timestamp = datetime.utcnow()
+        embed.set_footer(text=f"Author: {interaction.user.mention}", icon_url=interaction.user.display_avatar.url)
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        print(f"[set_player ERROR] {e}")
+        import traceback; traceback.print_exc()
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+        except:
+            pass
+
+
+# ── Delete Player Commands ─────────────────────────────────────
+@tree.command(name="delete_player", description="Remove a player (full=retired+fired roles, roster=roster only)")
+@app_commands.describe(
+    user="Discord user to remove",
+    mode="full (all roles + retired/fired) or roster (remove from roster + rank role only)"
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="full", value="full"),
+    app_commands.Choice(name="roster", value="roster"),
+])
+async def delete_player(interaction: discord.Interaction, user: discord.Member, mode: app_commands.Choice[str]):
+    try:
+        mod_role = interaction.guild.get_role(MOD_ROLE_ID)
+        if not mod_role or mod_role not in interaction.user.roles:
+            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+
+        if mode.value == "full":
+            # Find old user in roster to know their rank
+            old_user = roster_find_user_fast(user.name)
+            old_badge = old_user['badge'] if old_user else None
+            old_row = old_user['row'] if old_user else None
+            old_rank_name = old_user['rank'] if old_user else None
+            
+            # Remove ALL roles
+            for role in user.roles:
+                if role.name != "@everyone":
+                    try:
+                        await user.remove_roles(role, reason=f"Delete player (full) by {interaction.user.display_name}")
+                    except:
+                        pass
+            
+            # Add Retired and Fired roles
+            retired_role = discord.utils.get(interaction.guild.roles, name="Retired")
+            fired_role = discord.utils.get(interaction.guild.roles, name="Fired")
+            added = []
+            if retired_role:
+                await user.add_roles(retired_role, reason="Delete player - full")
+                added.append("Retired")
+            if fired_role:
+                await user.add_roles(fired_role, reason="Delete player - full")
+                added.append("Fired")
+            
+            # Clear nickname
+            clean_name = re.sub(r'^\([^)]+\)', '', user.display_name).strip()
+            try:
+                await user.edit(nick=clean_name or user.name, reason="Delete player - full")
+            except:
+                pass
+            
+            # Clear roster slot
+            if old_row:
+                roster_clear_slot_fast(old_row, old_badge or "")
+            
+            embed = discord.Embed(color=0xff0000)
+            embed.set_author(name=f"🚫 Player Removed (Full) {datetime.now().strftime('%Y-%m-%d')}")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Mode", value="Full Remove", inline=True)
+            if added:
+                embed.add_field(name="Roles Added", value=", ".join(added), inline=True)
+            embed.add_field(name="📋 Roster", value="✅ Cleared" if old_row else "⚠️ Not found in roster", inline=False)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            embed.set_footer(text=f"Author: {interaction.user.mention}", icon_url=interaction.user.display_avatar.url)
+            await interaction.followup.send(embed=embed)
+
+        elif mode.value == "roster":
+            # Find ALL matching rows by Discord
+            all_users = roster_find_all_users_fast(user.name)
+            if not all_users:
+                await interaction.followup.send("\u274c User not found in roster!", ephemeral=True)
+                return
+            
+            cleared = 0
+            removed_roles = []
+            for u in all_users:
+                # Remove rank role
+                role_name = RANK_SHEET_TO_ROLE.get(u['rank'])
+                if role_name:
+                    role = discord.utils.get(interaction.guild.roles, name=role_name)
+                    if role and role in user.roles:
+                        try:
+                            await user.remove_roles(role, reason="Delete player - roster")
+                            removed_roles.append(role.name)
+                        except:
+                            pass
+                # Clear roster slot
+                roster_clear_slot_fast(u['row'], u['badge'])
+                cleared += 1
+            
+            # Clear nickname
+            clean_name = re.sub(r'^\([^)]+\)', '', user.display_name).strip()
+            try:
+                await user.edit(nick=clean_name or user.name, reason="Delete player - roster")
+            except:
+                pass
+            
+            embed = discord.Embed(color=0xff9900)
+            embed.set_author(name=f"\U0001f4cb Player Removed from Roster {datetime.now().strftime('%Y-%m-%d')}")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Mode", value="Roster Only", inline=True)
+            embed.add_field(name="Rows Cleared", value=f"`{cleared}`", inline=True)
+            if removed_roles:
+                embed.add_field(name="Roles Removed", value=", ".join(set(removed_roles)), inline=False)
+            embed.add_field(name="\U0001f4cb Roster", value="\u2705 All slots cleared (Name, Discord, Badge, MEC)", inline=False)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            embed.set_footer(text=f"Author: {interaction.user.mention}", icon_url=interaction.user.display_avatar.url)
+            await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"[delete_player ERROR] {e}")
+        import traceback; traceback.print_exc()
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"\u274c Error: {e}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"\u274c Error: {e}", ephemeral=True)
+        except:
+            pass
+
+# ── POINT COMMANDS ─────────────────────────────────────────────
+POINT_ACTIONS = [
+    app_commands.Choice(name="show", value="show"),
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="edit", value="edit"),
+    app_commands.Choice(name="delete", value="delete"),
+]
+
+@tree.command(name="point", description="Manage personal points (show/add/edit/delete)")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.choices(action=POINT_ACTIONS)
+async def point(interaction: discord.Interaction, action: app_commands.Choice[str], user: discord.Member, value: int = 0):
+    try:
+        mod_role = interaction.guild.get_role(MOD_ROLE_ID)
+        if not mod_role or mod_role not in interaction.user.roles:
+            await interaction.response.send_message("❌ You don't have permission. Managements role required.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+        
+        act = action.value
+        user_id = str(user.id)
+        roster_user = roster_find_user_fast(user.name)
+        badge = roster_user['badge'] if roster_user else ''
+        nickname = user.display_name
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        if act == "show":
+            c.execute("SELECT points, gang_points FROM points WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            pts = row[0] if row else 0
+            gang_pts = row[1] if row else 0
+            
+            embed = discord.Embed(color=0x00d4ff)
+            embed.set_author(name=f"⭐ Points Info - {nickname}")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Personal Points", value=f"`{pts}`", inline=True)
+            embed.add_field(name="Gang Points", value=f"`{gang_pts}`", inline=True)
+            if badge:
+                embed.add_field(name="Badge", value=f"`{badge}`", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            await interaction.followup.send(embed=embed)
+            
+        elif act == "add":
+            if value <= 0:
+                await interaction.followup.send("❌ Value must be greater than 0 for 'add'.", ephemeral=True)
+                return
+            c.execute("""
+                INSERT INTO points (user_id, username, nickname, badge, points) 
+                VALUES (?, ?, ?, ?, ?) 
+                ON CONFLICT(user_id) DO UPDATE SET 
+                points = points + ?, username = ?, nickname = ?, badge = ?, updated_at = CURRENT_TIMESTAMP
+            """, (user_id, user.name, nickname, badge, value, value, user.name, nickname, badge))
+            
+            c.execute("INSERT INTO point_log (user_id, type, action, value, moderator_id) VALUES (?, 'points', 'add', ?, ?)",
+                      (user_id, value, str(interaction.user.id)))
+            conn.commit()
+            
+            c.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
+            new_total = c.fetchone()[0]
+            
+            # Sync to website
+            try:
+                urllib.request.urlopen("https://artinkashefi.ir/point_board/index.php", 
+                    data=urllib.parse.urlencode({
+                        'action': 'add_points', 'user_id': user_id, 'type': 'points', 
+                        'value': value, 'moderator_id': str(interaction.user.id),
+                        'username': user.name, 'nickname': nickname, 'badge': badge
+                    }).encode(), timeout=5)
+            except: pass
+            
+            embed = discord.Embed(color=0x00ff88)
+            embed.set_author(name=f"⭐ Points Added")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Added", value=f"`+{value}`", inline=True)
+            embed.add_field(name="New Total", value=f"`{new_total}`", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            embed.set_footer(text=f"By: {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+            
+        elif act == "edit":
+            c.execute("""
+                INSERT INTO points (user_id, username, nickname, badge, points) 
+                VALUES (?, ?, ?, ?, ?) 
+                ON CONFLICT(user_id) DO UPDATE SET 
+                points = ?, username = ?, nickname = ?, badge = ?, updated_at = CURRENT_TIMESTAMP
+            """, (user_id, user.name, nickname, badge, value, value, user.name, nickname, badge))
+            
+            c.execute("INSERT INTO point_log (user_id, type, action, value, moderator_id) VALUES (?, 'points', 'edit', ?, ?)",
+                      (user_id, value, str(interaction.user.id)))
+            conn.commit()
+            
+            # Sync to website
+            try:
+                urllib.request.urlopen("https://artinkashefi.ir/point_board/index.php", 
+                    data=urllib.parse.urlencode({
+                        'action': 'edit_points', 'user_id': user_id, 'type': 'points', 
+                        'value': value, 'moderator_id': str(interaction.user.id)
+                    }).encode(), timeout=5)
+            except: pass
+            
+            embed = discord.Embed(color=0xffaa00)
+            embed.set_author(name=f"✏️ Points Updated")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Set Total To", value=f"`{value}`", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            embed.set_footer(text=f"By: {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+            
+        elif act == "delete":
+            c.execute("UPDATE points SET points = 0 WHERE user_id = ?", (user_id,))
+            c.execute("INSERT INTO point_log (user_id, type, action, value, moderator_id) VALUES (?, 'points', 'delete', 0, ?)",
+                      (user_id, str(interaction.user.id)))
+            conn.commit()
+            
+            # Sync to website
+            try:
+                urllib.request.urlopen("https://artinkashefi.ir/point_board/index.php", 
+                    data=urllib.parse.urlencode({
+                        'action': 'delete_points', 'user_id': user_id, 'type': 'points', 
+                        'moderator_id': str(interaction.user.id)
+                    }).encode(), timeout=5)
+            except: pass
+            
+            embed = discord.Embed(color=0xff0055)
+            embed.set_author(name=f"🗑️ Points Cleared")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Status", value="`Reset to 0`", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            embed.set_footer(text=f"By: {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+            
+        conn.close()
+    except Exception as e:
+        print(f"[point ERROR] {e}")
+        import traceback; traceback.print_exc()
+
+@tree.command(name="gang_point", description="Manage gang points (show/add/edit/delete)")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+@app_commands.choices(action=POINT_ACTIONS)
+async def gang_point(interaction: discord.Interaction, action: app_commands.Choice[str], user: discord.Member, value: int = 0):
+    try:
+        mod_role = interaction.guild.get_role(MOD_ROLE_ID)
+        if not mod_role or mod_role not in interaction.user.roles:
+            await interaction.response.send_message("❌ You don't have permission. Managements role required.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=False)
+        
+        act = action.value
+        user_id = str(user.id)
+        roster_user = roster_find_user_fast(user.name)
+        badge = roster_user['badge'] if roster_user else ''
+        nickname = user.display_name
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        if act == "show":
+            c.execute("SELECT points, gang_points FROM points WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            pts = row[0] if row else 0
+            gang_pts = row[1] if row else 0
+            
+            embed = discord.Embed(color=0xa855f7)
+            embed.set_author(name=f"👑 Gang Points Info - {nickname}")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Gang Points", value=f"`{gang_pts}`", inline=True)
+            embed.add_field(name="Personal Points", value=f"`{pts}`", inline=True)
+            if badge:
+                embed.add_field(name="Badge", value=f"`{badge}`", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            await interaction.followup.send(embed=embed)
+            
+        elif act == "add":
+            if value <= 0:
+                await interaction.followup.send("❌ Value must be greater than 0 for 'add'.", ephemeral=True)
+                return
+            c.execute("""
+                INSERT INTO points (user_id, username, nickname, badge, gang_points) 
+                VALUES (?, ?, ?, ?, ?) 
+                ON CONFLICT(user_id) DO UPDATE SET 
+                gang_points = gang_points + ?, username = ?, nickname = ?, badge = ?, updated_at = CURRENT_TIMESTAMP
+            """, (user_id, user.name, nickname, badge, value, value, user.name, nickname, badge))
+            
+            c.execute("INSERT INTO point_log (user_id, type, action, value, moderator_id) VALUES (?, 'gang', 'add', ?, ?)",
+                      (user_id, value, str(interaction.user.id)))
+            conn.commit()
+            
+            c.execute("SELECT gang_points FROM points WHERE user_id = ?", (user_id,))
+            new_total = c.fetchone()[0]
+            
+            # Sync to website
+            try:
+                urllib.request.urlopen("https://artinkashefi.ir/point_board/index.php", 
+                    data=urllib.parse.urlencode({
+                        'action': 'add_points', 'user_id': user_id, 'type': 'gang', 
+                        'value': value, 'moderator_id': str(interaction.user.id),
+                        'username': user.name, 'nickname': nickname, 'badge': badge
+                    }).encode(), timeout=5)
+            except: pass
+            
+            embed = discord.Embed(color=0xa855f7)
+            embed.set_author(name=f"👑 Gang Points Added")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Added", value=f"`+{value}`", inline=True)
+            embed.add_field(name="New Gang Total", value=f"`{new_total}`", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            embed.set_footer(text=f"By: {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+            
+        elif act == "edit":
+            c.execute("""
+                INSERT INTO points (user_id, username, nickname, badge, gang_points) 
+                VALUES (?, ?, ?, ?, ?) 
+                ON CONFLICT(user_id) DO UPDATE SET 
+                gang_points = ?, username = ?, nickname = ?, badge = ?, updated_at = CURRENT_TIMESTAMP
+            """, (user_id, user.name, nickname, badge, value, value, user.name, nickname, badge))
+            
+            c.execute("INSERT INTO point_log (user_id, type, action, value, moderator_id) VALUES (?, 'gang', 'edit', ?, ?)",
+                      (user_id, value, str(interaction.user.id)))
+            conn.commit()
+            
+            # Sync to website
+            try:
+                urllib.request.urlopen("https://artinkashefi.ir/point_board/index.php", 
+                    data=urllib.parse.urlencode({
+                        'action': 'edit_points', 'user_id': user_id, 'type': 'gang', 
+                        'value': value, 'moderator_id': str(interaction.user.id)
+                    }).encode(), timeout=5)
+            except: pass
+            
+            embed = discord.Embed(color=0xffaa00)
+            embed.set_author(name=f"✏️ Gang Points Updated")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Set Gang Total To", value=f"`{value}`", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            embed.set_footer(text=f"By: {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+            
+        elif act == "delete":
+            c.execute("UPDATE points SET gang_points = 0 WHERE user_id = ?", (user_id,))
+            c.execute("INSERT INTO point_log (user_id, type, action, value, moderator_id) VALUES (?, 'gang', 'delete', 0, ?)",
+                      (user_id, str(interaction.user.id)))
+            conn.commit()
+            
+            # Sync to website
+            try:
+                urllib.request.urlopen("https://artinkashefi.ir/point_board/index.php", 
+                    data=urllib.parse.urlencode({
+                        'action': 'delete_points', 'user_id': user_id, 'type': 'gang', 
+                        'moderator_id': str(interaction.user.id)
+                    }).encode(), timeout=5)
+            except: pass
+            
+            embed = discord.Embed(color=0xff0055)
+            embed.set_author(name=f"🗑️ Gang Points Cleared")
+            embed.add_field(name="Player", value=user.mention, inline=True)
+            embed.add_field(name="Status", value="`Reset to 0`", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.timestamp = datetime.utcnow()
+            embed.set_footer(text=f"By: {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+            
+        conn.close()
+    except Exception as e:
+        print(f"[gang_point ERROR] {e}")
+        import traceback; traceback.print_exc()
+
+
+# Global error handler for slash commands
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"[CMD ERROR] {error}")
+    import traceback; traceback.print_exc()
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Error: {error}", ephemeral=True)
+    except:
+        pass
+def has_any_role(member, role_ids):
+    user_roles = [r.id for r in member.roles]
+    return any(r in user_roles for r in role_ids)
+
+
+def get_today_fine_amount(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    c.execute("SELECT COUNT(*) FROM gang_fines WHERE user_id=? AND date(created_at)=?", (str(user_id), today))
+    count = c.fetchone()[0]
+    conn.close()
+    return (count + 1) * 5000
+
+
+class FinePaymentView(discord.ui.View):
+    def __init__(self, fine_id):
+        super().__init__(timeout=None)
+        self.fine_id = fine_id
+
+    @discord.ui.button(label="Mark as Paid", style=discord.ButtonStyle.success, emoji="✅")
+    async def mark_paid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_any_role(interaction.user, [GANG_FINE_PAYMENT_ROLE]):
+            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE gang_fines SET paid=1 WHERE id=?", (self.fine_id,))
+        conn.commit()
+        conn.close()
+
+        embed = interaction.message.embeds[0]
+        embed.color = 0x2ecc71
+        embed.set_field_at(3, name="💳 Payment Status", value="✅ Paid", inline=False)
+
+        button.disabled = True
+        button.label = "Paid"
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@tree.command(name="gang_fine", description="Issue a gang impound fine")
+@app_commands.describe(user="Target user", plate="Vehicle plate")
+async def gang_fine(interaction: discord.Interaction, user: discord.Member, plate: str):
+    if not has_any_role(interaction.user, GANG_FINE_ALLOWED_ROLES):
+        await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+        return
+
+    amount = get_today_fine_amount(user.id)
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO gang_fines (user_id, plate, amount, moderator_id) VALUES (?, ?, ?, ?)",
+              (str(user.id), plate.upper(), amount, str(interaction.user.id)))
+    fine_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    embed = discord.Embed(
+        title="🚓 Vehicle Impound Report",
+        description="A vehicle has been officially impounded by the mechanic department.",
+        color=0xe67e22
+    )
+
+    embed.add_field(name="👤 Citizen", value=user.mention, inline=True)
+    embed.add_field(name="🚘 Vehicle Plate", value=f"`{plate.upper()}`", inline=True)
+    embed.add_field(name="💰 Fine Amount", value=f"`${amount:,}`", inline=True)
+    embed.add_field(name="💳 Payment Status", value="❌ Unpaid", inline=False)
+    embed.add_field(name="🛠️ Impounded By", value=interaction.user.mention, inline=True)
+    embed.add_field(name="📅 Date", value=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"), inline=True)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.set_footer(text="Infinity Roleplay • Mechanic Department")
+
+    await interaction.response.send_message(embed=embed, view=FinePaymentView(fine_id))
+
+
+if __name__ == "__main__":
+    init_db()
+    if not TOKEN:
+        print("❌ DISCORD_TOKEN not set")
+        exit(1)
+    bot.run(TOKEN)
+
